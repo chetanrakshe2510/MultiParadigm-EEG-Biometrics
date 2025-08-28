@@ -1,0 +1,10 @@
+# In 04_ml_analysis/requirements.txt
+h5py
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+tensorflow
+keras-tuner
+joblib

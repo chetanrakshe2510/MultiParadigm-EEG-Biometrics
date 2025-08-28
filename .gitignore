@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Data - Add paths to any large data files you don't want to upload
+
+data/*.h5
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,9 @@
+numpy
+h5py
+matplotlib
+pandas
+seaborn
+scikit-learn
+tensorflow
+keras-tuner
+joblib

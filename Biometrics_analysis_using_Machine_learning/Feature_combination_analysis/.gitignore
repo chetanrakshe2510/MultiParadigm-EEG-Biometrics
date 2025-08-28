@@ -1,0 +1,21 @@
+# Data 
+data/
+*.h5
+
+# Results and models
+results/
+models/
+kt_*
+*.pkl
+*.csv
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE and environment files
+.vscode/
+.idea/
+.env
+venv/

@@ -1,0 +1,33 @@
+# .gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE and OS-specific
+.idea/
+.vscode/
+.DS_Store
+
+# Virtual Environments
+venv/
+.env/
+env/
+
+# Data files (add your specific data files if they are too large for GitHub)
+# For example, if your H5 file is very large, uncomment the line below
+# *.h5
+
+# Generated output folders from your scripts
+cnn_artifacts/
+temp_results/
+cnn_final_report/
+mahalanobis_averaged_results/
+ml_plots_averaged/
+reports/
+
+# Generated output files
+*.png
+*.csv
+*.pkl
+model_run_*.h5
