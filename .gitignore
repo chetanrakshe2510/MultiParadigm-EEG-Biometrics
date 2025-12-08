@@ -6,6 +6,8 @@ __pycache__/
 # Data - Add paths to any large data files you don't want to upload
 
 data/*.h5
+*.h5
+Biometrics_analysis_using_Machine_learning/Core_multiparadigm_run1_run2/results/
 
 # IDE and OS files
 .vscode/

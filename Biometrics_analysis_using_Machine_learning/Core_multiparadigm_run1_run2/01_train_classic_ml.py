@@ -1,14 +1,16 @@
 import os
 import json
-import argparse # NEW: For command-line arguments
+import argparse
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn assns
+import seaborn as sns
 import logging
 from datetime import datetime
+import random # NEW: For random sampling in verification
 
+from scipy.interpolate import interp1d # NEW: For threshold interpolation
 from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
                              roc_curve, auc)
 from sklearn.preprocessing import label_binarize
@@ -22,7 +24,7 @@ import joblib
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 ###############################################################################
-# 1. Data Loading (No changes)
+# 1. Data Loading
 ###############################################################################
 def load_features_from_hdf5(filename):
     """Loads EEG features from an HDF5 file."""
@@ -44,7 +46,7 @@ def load_features_from_hdf5(filename):
     return np.array(X), np.array(y), np.array(runs), np.array(epoch_nums)
 
 ###############################################################################
-# 2. Plotting Functions (No changes)
+# 2. Plotting Functions
 ###############################################################################
 def inspect_data_variance(X, y, save_path="data_variance.png"):
     subjects = np.unique(y)
@@ -111,8 +113,231 @@ def plot_epoch_accuracy_heatmap(true_labels, predictions, epoch_nums_test, save_
     heatmap_data.to_csv(csv_name)
     logging.info(f"Saved epoch-wise classification matrix to {csv_name}")
 
+def plot_det_curve(fpr_test, fnr_test, eer, save_path, title="DET Curve"):
+    """Plots the Detection Error Tradeoff (DET) curve (FNR vs FPR)."""
+    plt.figure(figsize=(8, 6))
+    
+    # Plot FNR vs FPR
+    plt.plot(fpr_test, fnr_test, linewidth=2, label=f"Test Set (EER ≈ {eer*100:.2f}%)")
+    
+    # Locate EER point
+    eer_idx = np.argmin(np.abs(fpr_test - fnr_test))
+    plt.plot(fpr_test[eer_idx], fnr_test[eer_idx], 'ro', markersize=8, label='EER Point')
+    
+    plt.xscale('log') # Log scale is standard for DET curves
+    plt.yscale('log')
+    
+    # Set limits to avoid log(0) issues, adjust based on your data range
+    plt.xlim([0.0001, 1.0])
+    plt.ylim([0.0001, 1.0])
+    
+    plt.xlabel("False Acceptance Rate (FAR)")
+    plt.ylabel("False Rejection Rate (FRR)")
+    plt.title(title)
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 ###############################################################################
-# 3. Evaluation & Analysis Functions (Mostly no changes)
+# 3. Biometric Verification Logic (NEW)
+###############################################################################
+
+def generate_biometric_trials(y_test, scores_matrix, subject_list, impostor_samples=5):
+    """
+    Generates genuine and impostor score/label pairs for verification analysis.
+    Score = p(y=s | x), where s is the claimed identity.
+    """
+    scores, labels = [], []
+    subject_to_idx = {subj: i for i, subj in enumerate(subject_list)}
+    
+    for i in range(len(y_test)):
+        true_subj = y_test[i]
+        true_idx = subject_to_idx[true_subj]
+        
+        # 1. Genuine Trial (Claim = True Subject)
+        genuine_score = scores_matrix[i, true_idx]
+        scores.append(genuine_score)
+        labels.append(1) # Genuine
+        
+        # 2. Impostor Trials (Claim = Random Impostor Subject)
+        all_impostors = [s for s in subject_list if s != true_subj]
+        n_samples = min(impostor_samples, len(all_impostors))
+        
+        # Randomly sample impostor claimed identities
+        sampled_impostors = random.sample(all_impostors, n_samples)
+        
+        for imp_subj in sampled_impostors:
+            imp_idx = subject_to_idx[imp_subj]
+            impostor_score = scores_matrix[i, imp_idx]
+            scores.append(impostor_score)
+            labels.append(0) # Impostor
+
+    return np.array(scores), np.array(labels)
+
+def biometric_analysis_dev_test(y_test, scores_matrix, all_subjects, dev_subjects_count=10):
+    """
+    Splits the test set (Session 2) subjects into Dev (thresholding) and Test (reporting).
+    """
+    test_subjects = np.unique(y_test)
+    # Ensure we don't try to take more dev subjects than exist
+    if len(test_subjects) <= dev_subjects_count:
+        dev_subjects_count = len(test_subjects) // 2 
+    
+    # Shuffle subjects to create random split
+    # Note: For reproducibility in main runs, seeds are handled externally or by luck. 
+    # In bootstrapping, we want randomness.
+    test_subjects_list = list(test_subjects)
+    random.shuffle(test_subjects_list)
+    
+    dev_subjects = test_subjects_list[:dev_subjects_count]
+    final_test_subjects = test_subjects_list[dev_subjects_count:]
+    
+    # --- 1. Split Data based on Subject IDs ---
+    dev_mask = np.isin(y_test, dev_subjects)
+    test_mask = np.isin(y_test, final_test_subjects)
+    
+    # Handle edge case where split results in empty set
+    if not np.any(dev_mask) or not np.any(test_mask):
+        logging.warning("Dev/Test split resulted in empty set. Returning NaNs.")
+        return {}
+
+    y_dev = y_test[dev_mask]
+    scores_dev = scores_matrix[dev_mask]
+    
+    y_final_test = y_test[test_mask]
+    scores_final_test = scores_matrix[test_mask]
+
+    # --- 2. Generate Trials for Dev Set (Threshold Selection) ---
+    dev_scores, dev_labels = generate_biometric_trials(y_dev, scores_dev, all_subjects)
+    fpr, tpr, thresholds = roc_curve(dev_labels, dev_scores, pos_label=1)
+    fnr = 1 - tpr
+    
+    # Find EER threshold
+    eer_idx = np.argmin(np.abs(fpr - fnr))
+    eer_threshold = thresholds[eer_idx]
+    eer_rate = (fpr[eer_idx] + fnr[eer_idx]) / 2
+    
+    # Interpolate to find thresholds for specific target FARs
+    # We use 'extrapolate' cautiously; usually 0.01 and 0.001 are within range if N is large enough
+    fpr_interp = interp1d(fpr, thresholds, bounds_error=False, fill_value="extrapolate")
+    
+    thresh_far_1_pc = fpr_interp(0.01)
+    thresh_far_01_pc = fpr_interp(0.001)
+
+    # --- 3. Apply Thresholds to Final Test Set ---
+    test_scores, test_labels = generate_biometric_trials(y_final_test, scores_final_test, all_subjects)
+    
+    fpr_test, tpr_test, _ = roc_curve(test_labels, test_scores, pos_label=1)
+    fnr_test = 1 - tpr_test
+    auroc_test = auc(fpr_test, tpr_test)
+    
+    # Calculate FRR and FAR at operating points
+    def get_frr_far_at_threshold(scores, labels, threshold):
+        predictions = (scores >= threshold).astype(int)
+        
+        genuine_mask = labels == 1
+        impostor_mask = labels == 0
+        
+        # FRR (False Rejection Rate) -> Genuine rejected
+        fn = np.sum(predictions[genuine_mask] == 0)
+        tp = np.sum(predictions[genuine_mask] == 1)
+        frr = fn / (fn + tp) if (fn + tp) > 0 else 0
+        
+        # FAR (False Acceptance Rate) -> Impostor accepted
+        fp = np.sum(predictions[impostor_mask] == 1)
+        tn = np.sum(predictions[impostor_mask] == 0)
+        far = fp / (fp + tn) if (fp + tn) > 0 else 0
+        
+        return frr, far
+    
+    frr_1pc, far_1pc = get_frr_far_at_threshold(test_scores, test_labels, thresh_far_1_pc)
+    frr_01pc, far_01pc = get_frr_far_at_threshold(test_scores, test_labels, thresh_far_01_pc)
+    
+    return {
+        "auroc": auroc_test,
+        "fpr": fpr_test,
+        "fnr": fnr_test,
+        "frr_at_far1pc": frr_1pc,
+        "far_at_far1pc": far_1pc,
+        "frr_at_far01pc": frr_01pc,
+        "far_at_far01pc": far_01pc,
+        "eer_rate_dev": eer_rate,
+        "eer_threshold_dev": eer_threshold,
+        "test_scores": test_scores,
+        "test_labels": test_labels,
+    }
+
+def compute_biometric_ci(y_test, scores_matrix, all_subjects, n_bootstraps=200, dev_subjects_count=10):
+    """Computes confidence intervals using subject-level bootstrap."""
+    logging.info(f"Starting Bootstrapping ({n_bootstraps} iterations)...")
+    test_subjects_all = np.unique(y_test)
+    
+    bootstrapped_metrics = {
+        'auroc': [],
+        'eer': [],
+        'frr_at_far1pc': [],
+        'frr_at_far01pc': []
+    }
+    
+    for b in range(n_bootstraps):
+        if b % 50 == 0: logging.info(f"Bootstrap iteration {b}/{n_bootstraps}")
+        
+        # 1. Sample subjects with replacement
+        sampled_subjects = np.random.choice(test_subjects_all, size=len(test_subjects_all), replace=True)
+        
+        # 2. Split this specific bootstrap sample into Dev and Test
+        # (We shuffle the *names* we just picked)
+        random.shuffle(sampled_subjects)
+        dev_subjects = sampled_subjects[:dev_subjects_count]
+        final_test_subjects = sampled_subjects[dev_subjects_count:]
+        
+        if len(dev_subjects) < 2 or len(final_test_subjects) < 2:
+            continue
+
+        # 3. Construct the dataset for this bootstrap iteration
+        # Since we sampled with replacement, a subject might appear multiple times.
+        # We need to collect epochs for *each instance* of the subject.
+        y_sample_list = []
+        scores_sample_list = []
+        
+        # Pre-calculate indices for speed
+        subj_indices_map = {s: np.where(y_test == s)[0] for s in test_subjects_all}
+
+        for s in sampled_subjects:
+            indices = subj_indices_map[s]
+            y_sample_list.append(y_test[indices])
+            scores_sample_list.append(scores_matrix[indices])
+            
+        if not y_sample_list: continue
+            
+        y_sample = np.concatenate(y_sample_list)
+        scores_sample = np.concatenate(scores_sample_list)
+        
+        # --- Run Dev/Test Logic on this sample ---
+        # Note: We must pass the *original* all_subjects list for trial generation consistent with columns
+        res = biometric_analysis_dev_test(y_sample, scores_sample, all_subjects, dev_subjects_count)
+        
+        if not res: continue
+
+        bootstrapped_metrics['auroc'].append(res['auroc'])
+        bootstrapped_metrics['eer'].append(res['eer_rate_dev'])
+        bootstrapped_metrics['frr_at_far1pc'].append(res['frr_at_far1pc'])
+        bootstrapped_metrics['frr_at_far01pc'].append(res['frr_at_far01pc'])
+        
+    # Calculate CIs (2.5 and 97.5 percentiles)
+    cis = {}
+    for metric, values in bootstrapped_metrics.items():
+        if len(values) > 0:
+            cis[metric] = np.percentile(values, [2.5, 97.5])
+        else:
+            cis[metric] = [0, 0]
+            
+    return cis, bootstrapped_metrics
+
+###############################################################################
+# 4. Evaluation & Analysis Functions
 ###############################################################################
 def evaluate_predictions(y_true, predictions, subjects):
     accuracy = accuracy_score(y_true, predictions)
@@ -135,6 +360,7 @@ def across_run_analysis_ml(classifier, param_grid, X, y, runs, epoch_nums, class
     X_test_flat = X_test.reshape(X_test.shape[0], -1)
     
     # Hyperparameter tuning
+    logging.info(f"Tuning {classifier_name}...")
     grid_search = GridSearchCV(estimator=classifier, param_grid=param_grid, cv=cv, scoring='accuracy', n_jobs=-1)
     grid_search.fit(X_train_flat, y_train)
     
@@ -154,13 +380,24 @@ def across_run_analysis_ml(classifier, param_grid, X, y, runs, epoch_nums, class
              scores_matrix = np.exp(decision_vals) / (1 + np.exp(decision_vals)) # Sigmoid for binary
              scores_matrix = np.vstack([1-scores_matrix, scores_matrix]).T
         else:
-            scores_matrix = decision_vals
-    else: # Fallback for classifiers without probability scores
+            # For SVM, decision_function usually gives distances. 
+            # We can use sigmoid to approximate probabilities if predict_proba=False, 
+            # but we set probability=True in main config.
+            scores_matrix = decision_vals 
+    else: 
         scores_matrix = label_binarize(predictions, classes=subjects_unique)
         
+    # --- NEW: Primary Biometric Verification (Single Pass for Point Estimates) ---
+    logging.info("Running initial Dev/Test split for point estimates...")
+    biometric_results = biometric_analysis_dev_test(
+        y_test, scores_matrix, subjects_unique
+    )
+    
+    # Simple classification for reference
     accuracy, f1, cm = evaluate_predictions(y_test, predictions, subjects_unique)
 
-    return {
+    # Combine everything
+    full_results = {
         "accuracy": accuracy,
         "f1": f1,
         "confusion_matrix": cm,
@@ -171,9 +408,15 @@ def across_run_analysis_ml(classifier, param_grid, X, y, runs, epoch_nums, class
         "subjects": subjects_unique,
         "fitted_classifier": best_classifier
     }
+    
+    # Add biometric results if successful
+    if biometric_results:
+        full_results.update(biometric_results)
+        
+    return full_results
 
 ###############################################################################
-# 4. Utility Functions (No changes)
+# 5. Utility Functions
 ###############################################################################
 def save_artifact(artifact, filepath):
     try:
@@ -198,7 +441,7 @@ def create_versioned_dir(base_dir):
     return versioned_dir
 
 ###############################################################################
-# 5. Main Script Logic
+# 6. Main Script Logic
 ###############################################################################
 def main(args):
     # Create a single versioned directory for this entire run
@@ -209,17 +452,13 @@ def main(args):
     logging.info(f"Loading data from {args.data_file}")
     X, y, runs, epoch_nums = load_features_from_hdf5(args.data_file)
     
-    # NOTE: Reshaping seems to have a typo in the original (32x32 -> 32x28). Correcting.
-    # Assuming the features are (n, 32, 32) and reshaping back to that after transformation.
     original_shape = X.shape
     X_flat = X.reshape(original_shape[0], -1)
-    # X = X_flat.reshape(original_shape) # Corrected reshaping
 
     inspect_data_variance(X, y, save_path=os.path.join(plots_folder, "data_variance.png"))
     
     comparison_results = []
     
-    # NEW: Central model configuration
     MODEL_CONFIG = {
         "LogisticRegression": {
             "estimator": LogisticRegression(max_iter=1000, random_state=42),
@@ -241,7 +480,6 @@ def main(args):
         }
     }
 
-    # REFACTORED: Loop through models instead of repeating code
     for model_name, config in MODEL_CONFIG.items():
         logging.info(f"=== Across-Run Analysis: {model_name} with Tuning ===")
         results = across_run_analysis_ml(
@@ -252,14 +490,37 @@ def main(args):
             cv=3
         )
         
+        # --- NEW: Compute 95% CIs via Bootstrapping ---
+        cis, raw_metrics = compute_biometric_ci(
+            results["true_labels"], 
+            results["scores_matrix"], 
+            results["subjects"],
+            n_bootstraps=200  # Adjust as needed (e.g., 1000 for final paper)
+        )
+        
+        # Format results string with Mean and CI
+        def fmt_ci(metric_key, val_key, scale=1.0):
+            mean_val = results.get(val_key, 0) * scale
+            ci_low = cis[metric_key][0] * scale
+            ci_high = cis[metric_key][1] * scale
+            return f"{mean_val:.2f} ({ci_low:.2f}-{ci_high:.2f})"
+
         # Store results for final comparison
-        comparison_results.append({
+        row = {
             "Classifier": model_name,
             "Accuracy": results["accuracy"],
-            "F1_Score": results["f1"]
-        })
+            "F1_Score": results["f1"],
+            "AUROC_CI": fmt_ci('auroc', 'auroc', 1.0),
+            "EER_Dev_CI": fmt_ci('eer', 'eer_rate_dev', 100.0) + "%",
+            "FRR@FAR1%_CI": fmt_ci('frr_at_far1pc', 'frr_at_far1pc', 100.0) + "%",
+            "FRR@FAR0.1%_CI": fmt_ci('frr_at_far01pc', 'frr_at_far01pc', 100.0) + "%"
+        }
+        comparison_results.append(row)
+        
+        # Save raw metrics for later custom plotting if needed
+        save_artifact(raw_metrics, os.path.join(versioned_run_dir, f"ci_metrics_{model_name.lower()}.pkl"))
 
-        # Save model and plots
+        # Save model and standard plots
         save_artifact(results["fitted_classifier"], os.path.join(versioned_run_dir, f"{model_name.lower()}_model.pkl"))
         
         plot_confusion_matrix(results["confusion_matrix"], results["subjects"],
@@ -273,11 +534,18 @@ def main(args):
         plot_epoch_accuracy_heatmap(results["true_labels"], results["predictions"], results["epoch_nums_test"],
                                     save_path=os.path.join(plots_folder, f"epoch_heatmap_{model_name}.png"),
                                     csv_name=os.path.join(plots_folder, f"epoch_accuracy_{model_name}.csv"))
+                                    
+        # --- NEW: Plot DET Curve ---
+        if 'fpr' in results and 'fnr' in results:
+             plot_det_curve(results['fpr'], results['fnr'], results.get('eer_rate_dev', 0),
+                            save_path=os.path.join(plots_folder, f"det_{model_name}.png"),
+                            title=f"{model_name} DET Curve (Log-Log)")
 
     # Save overall comparison CSV
     df_comparison = pd.DataFrame(comparison_results)
     df_comparison.to_csv(os.path.join(versioned_run_dir, "ml_classifiers_comparison.csv"), index=False)
     logging.info(f"Comparison metrics saved to {os.path.join(versioned_run_dir, 'ml_classifiers_comparison.csv')}")
+    print(df_comparison)
 
     # Save experiment metadata
     metadata = {
@@ -294,7 +562,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # NEW: Add argument parser for better usability
     parser = argparse.ArgumentParser(description="Run ML classification experiments on EEG data.")
     parser.add_argument('--data_file', type=str, required=True, help="Path to the HDF5 data file.")
     parser.add_argument('--output_dir', type=str, default="results", help="Directory to save models and plots.")
