@@ -5,6 +5,8 @@ import joblib
 import pandas as pd
 import matplotlib.pyplot as plt
 import tensorflow as tf
+import random
+from scipy.interpolate import interp1d
 from tensorflow.keras import layers, models, utils, callbacks
 from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import PowerTransformer, LabelEncoder
@@ -19,14 +21,7 @@ import keras_tuner as kt
 # 1. Data Loading
 ###############################################################################
 def load_features_from_hdf5(filename):
-    """
-    Loads EEG features from an HDF5 file in 32x32 format.
-    Returns:
-      X: (n_samples, 32, 32)
-      y: subject labels (e.g., "01", "02", etc.)
-      runs: run labels (e.g., "Run_1", "Run_2")
-      epoch_nums: epoch indices
-    """
+    """Loads EEG features from an HDF5 file."""
     X, y, runs, epoch_nums = [], [], [], []
     with h5py.File(filename, 'r') as h5f:
         for class_key in h5f.keys():
@@ -36,7 +31,7 @@ def load_features_from_hdf5(filename):
                 run_group = class_group[run_key]
                 for epoch_key in run_group.keys():
                     epoch_group = run_group[epoch_key]
-                    feats = epoch_group['features'][()]  # shape (32,32)
+                    feats = epoch_group['features'][()]
                     X.append(feats)
                     y.append(subject_code)
                     runs.append(run_key)
@@ -45,26 +40,126 @@ def load_features_from_hdf5(filename):
     return np.array(X), np.array(y), np.array(runs), np.array(epoch_nums)
 
 ###############################################################################
-# 2. Hypermodel for 1D CNN using Keras Tuner
+# 2. Biometric Verification Helpers (Uniform Analysis)
+###############################################################################
+def generate_biometric_trials(y_test, scores_matrix, subject_list, impostor_samples=5):
+    scores, labels = [], []
+    subject_to_idx = {subj: i for i, subj in enumerate(subject_list)}
+    
+    for i in range(len(y_test)):
+        true_subj = y_test[i]
+        true_idx = subject_to_idx[true_subj]
+        
+        # Genuine Trial
+        scores.append(scores_matrix[i, true_idx])
+        labels.append(1) 
+        
+        # Impostor Trials
+        all_impostors = [s for s in subject_list if s != true_subj]
+        n_samples = min(impostor_samples, len(all_impostors))
+        sampled_impostors = random.sample(all_impostors, n_samples)
+        
+        for imp_subj in sampled_impostors:
+            imp_idx = subject_to_idx[imp_subj]
+            scores.append(scores_matrix[i, imp_idx])
+            labels.append(0)
+
+    return np.array(scores), np.array(labels)
+
+def biometric_analysis_dev_test(y_test, scores_matrix, all_subjects, dev_subjects_count=10):
+    test_subjects = np.unique(y_test)
+    if len(test_subjects) <= dev_subjects_count:
+        dev_subjects_count = len(test_subjects) // 2 
+    
+    test_subjects_list = list(test_subjects)
+    random.shuffle(test_subjects_list)
+    
+    dev_subjects = test_subjects_list[:dev_subjects_count]
+    final_test_subjects = test_subjects_list[dev_subjects_count:]
+    
+    dev_mask = np.isin(y_test, dev_subjects)
+    test_mask = np.isin(y_test, final_test_subjects)
+    
+    if not np.any(dev_mask) or not np.any(test_mask): return {}
+
+    # Dev Set (Thresholding)
+    dev_scores, dev_labels = generate_biometric_trials(y_test[dev_mask], scores_matrix[dev_mask], all_subjects)
+    fpr, tpr, thresholds = roc_curve(dev_labels, dev_scores, pos_label=1)
+    fnr = 1 - tpr
+    
+    eer_idx = np.argmin(np.abs(fpr - fnr))
+    eer_rate = (fpr[eer_idx] + fnr[eer_idx]) / 2
+    
+    fpr_interp = interp1d(fpr, thresholds, bounds_error=False, fill_value="extrapolate")
+    thresh_far_1_pc = fpr_interp(0.01)
+    thresh_far_01_pc = fpr_interp(0.001)
+
+    # Test Set (Reporting)
+    test_scores, test_labels = generate_biometric_trials(y_test[test_mask], scores_matrix[test_mask], all_subjects)
+    fpr_test, tpr_test, _ = roc_curve(test_labels, test_scores, pos_label=1)
+    fnr_test = 1 - tpr_test
+    auroc_test = auc(fpr_test, tpr_test)
+    
+    def get_frr_at_thresh(s, l, t):
+        preds = (s >= t).astype(int)
+        gen_mask = (l == 1)
+        fn = np.sum(preds[gen_mask] == 0)
+        tp = np.sum(preds[gen_mask] == 1)
+        return fn / (fn + tp) if (fn + tp) > 0 else 0
+    
+    return {
+        "auroc": auroc_test,
+        "fpr": fpr_test,
+        "fnr": fnr_test,
+        "frr_at_far1pc": get_frr_at_thresh(test_scores, test_labels, thresh_far_1_pc),
+        "frr_at_far01pc": get_frr_at_thresh(test_scores, test_labels, thresh_far_01_pc),
+        "eer_rate_dev": eer_rate
+    }
+
+def compute_biometric_ci(y_test, scores_matrix, all_subjects, n_bootstraps=200):
+    print(f"Starting Bootstrapping ({n_bootstraps} iterations)...")
+    test_subjects_all = np.unique(y_test)
+    metrics = {'auroc': [], 'eer': [], 'frr_at_far1pc': [], 'frr_at_far01pc': []}
+    
+    subj_indices_map = {s: np.where(y_test == s)[0] for s in test_subjects_all}
+
+    for b in range(n_bootstraps):
+        sampled_subjects = np.random.choice(test_subjects_all, size=len(test_subjects_all), replace=True)
+        
+        indices = []
+        for s in sampled_subjects:
+            indices.extend(subj_indices_map[s])
+        
+        if not indices: continue
+        indices = np.array(indices)
+        
+        res = biometric_analysis_dev_test(y_test[indices], scores_matrix[indices], all_subjects)
+        if res:
+            metrics['auroc'].append(res['auroc'])
+            metrics['eer'].append(res['eer_rate_dev'])
+            metrics['frr_at_far1pc'].append(res['frr_at_far1pc'])
+            metrics['frr_at_far01pc'].append(res['frr_at_far01pc'])
+            
+    cis = {}
+    for m, vals in metrics.items():
+        cis[m] = np.percentile(vals, [2.5, 97.5]) if vals else [0, 0]
+    return cis, metrics
+
+###############################################################################
+# 3. Hypermodel
 ###############################################################################
 def build_tunable_1d_cnn_model(hp):
-    """
-    Builds a 1D CNN model with hyperparameters specified via keras_tuner.
-    """
     filters_1 = hp.Int('filters_1', min_value=16, max_value=64, step=16, default=32)
     kernel_size_1 = hp.Choice('kernel_size_1', values=[3, 5, 7], default=5)
     filters_2 = hp.Int('filters_2', min_value=32, max_value=128, step=32, default=64)
     kernel_size_2 = hp.Choice('kernel_size_2', values=[3, 5], default=3)
     dense_units = hp.Int('dense_units', min_value=64, max_value=256, step=64, default=128)
     dropout_rate = hp.Float('dropout_rate', min_value=0.0, max_value=0.5, step=0.1, default=0.2)
-    learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=1e-2,
-                             sampling='LOG', default=1e-3)
+    learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='LOG', default=1e-3)
 
     global input_shape, num_classes
-
     model = models.Sequential([
-        layers.Conv1D(filters=filters_1, kernel_size=kernel_size_1,
-                      activation='relu', input_shape=input_shape),
+        layers.Conv1D(filters=filters_1, kernel_size=kernel_size_1, activation='relu', input_shape=input_shape),
         layers.MaxPooling1D(pool_size=2),
         layers.Conv1D(filters=filters_2, kernel_size=kernel_size_2, activation='relu'),
         layers.MaxPooling1D(pool_size=2),
@@ -73,216 +168,133 @@ def build_tunable_1d_cnn_model(hp):
         layers.Dropout(dropout_rate),
         layers.Dense(num_classes, activation='softmax')
     ])
-
-    optimizer = Adam(learning_rate=learning_rate)
-    model.compile(optimizer=optimizer,
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
 ###############################################################################
-# 3. Main Script: Hyperparameter Tuning for 1D CNN
+# 4. Main Script
 ###############################################################################
 def main():
-    # 3.1 Check that the HDF5 file exists
     filename = "all_subjects_merged_new_full_epochs.h5"
     if not os.path.exists(filename):
-        raise FileNotFoundError(f"{filename} not found. Please ensure the file exists.")
+        raise FileNotFoundError(f"{filename} not found.")
 
-    # 3.2 Load data
     X, y, runs, epoch_nums = load_features_from_hdf5(filename)
 
-    # 3.3 Apply PowerTransformer
-    transformer = PowerTransformer(method='yeo-johnson')
-    X_flat = X.reshape(X.shape[0], -1)
-    # === CHECK: confirm that reshaping from 32×32 → 32×28 is intentional ===
-    X_tf = transformer.fit_transform(X_flat)
-    X_transformed = X_tf.reshape(X.shape[0], 32, 28)
-    joblib.dump(transformer, "power_transformer.pkl")
-
-    # 3.4 Split into train/test by run
+    # === FIX: DATA LEAKAGE PREVENTION ===
+    # 1. Identify indices
     train_idx = np.where(runs == "Run_1")[0]
     test_idx  = np.where(runs == "Run_2")[0]
+    
     if len(train_idx)==0 or len(test_idx)==0:
-        raise ValueError("Insufficient data for Run_1 or Run_2. Please check your run labels.")
+        raise ValueError("Insufficient data for Run_1 or Run_2.")
 
-    X_train = X_transformed[train_idx]
-    X_test  = X_transformed[test_idx]
+    # 2. Reshape for Transformer
+    X_flat = X.reshape(X.shape[0], -1)
+    
+    # 3. Fit Transformer ONLY on Training Data
+    transformer = PowerTransformer(method='yeo-johnson')
+    X_train_flat = X_flat[train_idx]
+    transformer.fit(X_train_flat)
+    
+    # 4. Transform both sets
+    X_train_flat = transformer.transform(X_flat[train_idx])
+    X_test_flat = transformer.transform(X_flat[test_idx])
+    
+    # 5. Reshape back for CNN (assuming 32x28 structure after transform, check dimensions!)
+    # Note: PowerTransformer keeps dimensions. If input was (N, 1024), output is (N, 1024).
+    # We treat it as a 1D sequence of length 1024 for 1D CNN.
+    flattened_length = X_train_flat.shape[1]
+    
+    X_train_cnn = X_train_flat.reshape(X_train_flat.shape[0], flattened_length, 1)
+    X_test_cnn = X_test_flat.reshape(X_test_flat.shape[0], flattened_length, 1)
+
     y_train = y[train_idx]
     y_test  = y[test_idx]
 
-    # 3.5 Flatten for 1D CNN
-    X_train_flat = X_train.reshape(X_train.shape[0], -1)
-    X_test_flat  = X_test.reshape( X_test.shape[0],  -1)
+    joblib.dump(transformer, "power_transformer_cnn.pkl")
 
-    # 3.6 Define global model shape & number of classes
-    global input_shape, num_classes
-    flattened_length = X_train_flat.shape[1]
+    # === Label Encoding ===
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(y_train)
+    y_test_enc = le.transform(y_test)
+    
+    global num_classes, input_shape
+    num_classes = len(np.unique(y_train_enc))
     input_shape = (flattened_length, 1)
+    
+    y_train_cat = utils.to_categorical(y_train_enc, num_classes=num_classes)
+    y_test_cat = utils.to_categorical(y_test_enc, num_classes=num_classes)
 
-    # 3.7 Reshape for Conv1D
-    X_train_cnn = X_train_flat.reshape(X_train_flat.shape[0], flattened_length, 1)
-    X_test_cnn  = X_test_flat .reshape(X_test_flat.shape[0],   flattened_length, 1)
-
-    # 3.8 Encode labels
-    le           = LabelEncoder()
-    y_train_enc  = le.fit_transform(y_train)
-    y_test_enc   = le.transform(y_test)
-    num_classes  = len(np.unique(y_train_enc))
-    y_train_cat  = utils.to_categorical(y_train_enc, num_classes=num_classes)
-    y_test_cat   = utils.to_categorical( y_test_enc, num_classes=num_classes)
-
-    # === 1) STRATIFIED SPLIT & monitor val_accuracy ===
+    # === Tuning Split ===
     X_train_sub, X_val, y_train_sub_cat, y_val_cat = train_test_split(
-        X_train_cnn, y_train_cat,
-        test_size=0.1,
-        stratify=y_train_enc,
-        random_state=42
-    )
-    early_stop = callbacks.EarlyStopping(
-        monitor='val_accuracy',  # was 'val_loss'
-        patience=3,
-        restore_best_weights=True
+        X_train_cnn, y_train_cat, test_size=0.1, stratify=y_train_enc, random_state=42
     )
 
-    # 3.9 Keras Tuner setup
     tuner = kt.RandomSearch(
         build_tunable_1d_cnn_model,
         objective='val_accuracy',
         max_trials=10,
-        executions_per_trial=1,
         directory='kt_1d_cnn_tuning',
-        project_name='1d_cnn'
+        project_name='1d_cnn_v2'
     )
+    
+    early_stop = callbacks.EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True)
+    
+    tuner.search(X_train_sub, y_train_sub_cat, validation_data=(X_val, y_val_cat),
+                 epochs=20, callbacks=[early_stop], verbose=1)
 
-    # 3.10 Hyperparameter search
-    tuner.search(
-        X_train_sub, y_train_sub_cat,
-        validation_data=(X_val, y_val_cat),
-        epochs=20,
-        callbacks=[early_stop],
-        verbose=1
-    )
-
-    # 3.11 Best hyperparameters
     best_hp = tuner.get_best_hyperparameters(num_trials=1)[0]
-    print("The optimal hyperparameters are:")
-    for name in ['filters_1','kernel_size_1','filters_2',
-                 'kernel_size_2','dense_units',
-                 'dropout_rate','learning_rate']:
-        print(f"  {name}: {best_hp.get(name)}")
-
-    # 3.12 Build & train best model, capture history
     best_model = tuner.hypermodel.build(best_hp)
-    history    = best_model.fit(
-        X_train_sub, y_train_sub_cat,
-        epochs=20,
-        validation_data=(X_val, y_val_cat),
-        callbacks=[early_stop],
-        verbose=1
-    )
+    
+    history = best_model.fit(X_train_sub, y_train_sub_cat, epochs=20, 
+                             validation_data=(X_val, y_val_cat), callbacks=[early_stop], verbose=1)
 
-    # === Plot & save training vs. validation LOSS ===
-    plt.figure()
-    plt.plot(history.history['loss'], label='Train Loss')
-    plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.title('Training vs. Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('training_validation_loss.png')
-    plt.close()
-
-    # === Plot & save training vs. validation ACCURACY ===
-    plt.figure()
-    plt.plot(history.history['accuracy'], label='Train Accuracy')
-    plt.plot(history.history['val_accuracy'], label='Val Accuracy')
-    plt.title('Training vs. Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('training_validation_accuracy.png')
-    plt.close()
-
-    # 3.13 Evaluate on test set
+    # === Basic Evaluation ===
     test_loss, test_acc = best_model.evaluate(X_test_cnn, y_test_cat, verbose=0)
-    print(f"Test Accuracy: {test_acc:.4f}")
-
-    # 3.14 Predictions & basic metrics
     preds_prob = best_model.predict(X_test_cnn)
-    preds_enc  = np.argmax(preds_prob, axis=1)
-    preds      = le.inverse_transform(preds_enc)
-
-    acc       = accuracy_score(   y_test, preds)
-    f1        = f1_score(         y_test, preds, average='weighted', zero_division=0)
-    precision = precision_score(  y_test, preds, average='weighted', zero_division=0)
-    recall    = recall_score(     y_test, preds, average='weighted', zero_division=0)
-    cm        = confusion_matrix( y_test, preds)
-
-    print(f"Accuracy:  {acc:.4f}")
-    print(f"F1 Score:  {f1:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print("Confusion Matrix:")
-    print(cm)
-
-    # === 2) NORMALIZED CONFUSION MATRIX ===
-    cm_norm = cm.astype(float) / cm.sum(axis=1)[:, np.newaxis]
-    plt.figure(figsize=(8,6))
-    plt.imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title('Normalized Confusion Matrix')
-    plt.colorbar()
-    ticks = np.arange(num_classes)
-    plt.xticks(ticks, le.classes_, rotation=45)
-    plt.yticks(ticks, le.classes_)
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.tight_layout()
-    plt.savefig('confusion_matrix_normalized.png')
+    preds_enc = np.argmax(preds_prob, axis=1)
+    preds = le.inverse_transform(preds_enc)
+    
+    # === NEW: BIOMETRIC VERIFICATION ANALYSIS ===
+    print("\n--- Running Biometric Verification Analysis (Bootstrapped) ---")
+    cis, metrics = compute_biometric_ci(y_test, preds_prob, le.classes_, n_bootstraps=200)
+    
+    # Get point estimates (single run)
+    point_est = biometric_analysis_dev_test(y_test, preds_prob, le.classes_)
+    
+    # === PLOTS ===
+    # 1. DET Curve
+    plt.figure(figsize=(8, 6))
+    plt.plot(point_est['fpr'], point_est['fnr'], label=f"CNN (EER={point_est['eer_rate_dev']*100:.2f}%)")
+    plt.xscale('log'); plt.yscale('log')
+    plt.xlabel('False Acceptance Rate (FAR)'); plt.ylabel('False Rejection Rate (FRR)')
+    plt.title('DET Curve (1D CNN)')
+    plt.grid(True, which="both", ls="--")
+    plt.legend()
+    plt.savefig('det_curve_cnn.png')
     plt.close()
-
-    # === 3) CLASSIFICATION REPORT CSV ===
-    report = classification_report(y_test, preds, output_dict=True)
-    report_df = pd.DataFrame(report).transpose()
-    report_df.to_csv('classification_report_1d_cnn.csv', index=True)
-    print("[INFO] Saved classification report to classification_report_1d_cnn.csv")
-
-    # === 4) PER-CLASS ROC CURVES ===
-    y_test_bin = utils.to_categorical(y_test_enc, num_classes=num_classes)
+    
+    # 2. Accuracy/Loss Curves (Original)
     plt.figure()
-    for i, cls in enumerate(le.classes_):
-        fpr, tpr, _ = roc_curve(y_test_bin[:, i], preds_prob[:, i])
-        roc_auc = auc(fpr, tpr)
-        plt.plot(fpr, tpr, label=f"{cls} (AUC = {roc_auc:.2f})")
-    plt.plot([0,1], [0,1], 'k--', lw=1)
-    plt.title('Per-Class ROC Curves')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.legend(loc='lower right')
-    plt.tight_layout()
-    plt.savefig('roc_curve_per_class.png')
-    plt.close()
-
-    # === 5) SAVE OVERALL METRICS & PREDICTIONS CSVs ===
-    metrics_df = pd.DataFrame([{
-        "Accuracy":  acc,
-        "F1_Score":  f1,
-        "Precision": precision,
-        "Recall":    recall
-    }])
-    metrics_df.to_csv("performance_metrics_1d_cnn.csv", index=False)
-    preds_df = pd.DataFrame({
-        "True_Label":      y_test,
-        "Predicted_Label": preds
-    })
-    preds_df.to_csv("predictions_vs_true_1d_cnn.csv", index=False)
-    print("[INFO] Saved overall metrics and sample‐level predictions")
-
-    # 3.16 Save model and encoder
+    plt.plot(history.history['accuracy'], label='Train'); plt.plot(history.history['val_accuracy'], label='Val')
+    plt.title('Accuracy'); plt.legend(); plt.savefig('training_acc.png'); plt.close()
+    
+    # === REPORTING ===
+    results = {
+        "Test Accuracy": f"{test_acc:.4f}",
+        "EER (Dev)": f"{point_est['eer_rate_dev']*100:.2f}% ({cis['eer'][0]*100:.2f}-{cis['eer'][1]*100:.2f})",
+        "FRR @ 1% FAR": f"{point_est['frr_at_far1pc']*100:.2f}% ({cis['frr_at_far1pc'][0]*100:.2f}-{cis['frr_at_far1pc'][1]*100:.2f})",
+        "FRR @ 0.1% FAR": f"{point_est['frr_at_far01pc']*100:.2f}% ({cis['frr_at_far01pc'][0]*100:.2f}-{cis['frr_at_far01pc'][1]*100:.2f})"
+    }
+    
+    print("\n=== FINAL RESULTS (Uniform Analysis) ===")
+    for k, v in results.items():
+        print(f"{k}: {v}")
+        
+    # Save Results
+    pd.DataFrame([results]).to_csv("cnn_biometric_results.csv", index=False)
     best_model.save("best_1d_cnn_model.h5")
-    joblib.dump(le, "label_encoder.pkl")
 
 if __name__ == "__main__":
     main()
