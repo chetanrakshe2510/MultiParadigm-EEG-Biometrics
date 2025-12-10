@@ -8,7 +8,7 @@ __pycache__/
 *.json
 
 # Data - Add paths to any large data files you don't want to upload
-
+Imp_biometrics/
 data/*.h5
 *.h5
 Biometrics_analysis_using_Machine_learning/Core_multiparadigm_run1_run2/results/

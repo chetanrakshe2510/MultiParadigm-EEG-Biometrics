@@ -329,18 +329,40 @@ def across_run_analysis(X, y, runs, epoch_nums, alpha):
         "point_est": point_est # ROC/DET curve data
     }
 
-def compute_per_subject_metrics(true_labels, predictions, subjects):
+def compute_per_subject_metrics(true_labels, predictions, scores_matrix, subjects):
     rows = []
+    # Create mapping of subject to scores column index
+    subj_to_idx = {s: i for i, s in enumerate(subjects)}
+
     for subj in subjects:
-        y_true_binary = (np.array(true_labels) == subj)
-        y_pred_binary = (np.array(predictions) == subj)
-        tn, fp, fn, tp = confusion_matrix(y_true_binary, y_pred_binary).ravel()
+        # Create binary labels for One-vs-Rest
+        y_true_binary = (np.array(true_labels) == subj).astype(int)
+        y_pred_binary = (np.array(predictions) == subj).astype(int)
+        
+        # Get raw scores for this subject (for EER calculation)
+        col_idx = subj_to_idx[subj]
+        y_scores_binary = scores_matrix[:, col_idx]
+
+        acc = accuracy_score(y_true_binary, y_pred_binary)
+        prec = precision_score(y_true_binary, y_pred_binary, zero_division=0)
+        rec = recall_score(y_true_binary, y_pred_binary, zero_division=0)
+        f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+        
+        try:
+            fpr, tpr, _ = roc_curve(y_true_binary, y_scores_binary, pos_label=1)
+            fnr = 1 - tpr
+            eer_idx = np.nanargmin(np.abs(fpr - fnr))
+            eer = (fpr[eer_idx] + fnr[eer_idx]) / 2
+        except Exception:
+            eer = np.nan
+
         rows.append({
             "Subject": subj,
-            "Precision": precision_score(y_true_binary, y_pred_binary, zero_division=0),
-            "Recall": recall_score(y_true_binary, y_pred_binary, zero_division=0),
-            "F1-Score": f1_score(y_true_binary, y_pred_binary, zero_division=0),
-            "Specificity": tn / (tn + fp) if (tn + fp) > 0 else 0
+            "Accuracy": acc,
+            "Precision": prec,
+            "Recall": rec,
+            "F1_Score": f1,
+            "EER": eer
         })
     return pd.DataFrame(rows)
 
@@ -414,7 +436,13 @@ def main(args):
                                 csv_path=os.path.join(reports_dir, "epoch_wise_accuracy.csv"))
 
     # --- Save CSV Reports ---
-    df_per_subject = compute_per_subject_metrics(results['true_labels'], results['predictions'], results['subjects'])
+    # Updated call with scores_matrix
+    df_per_subject = compute_per_subject_metrics(
+        results['true_labels'], 
+        results['predictions'], 
+        results['scores_matrix'], 
+        results['subjects']
+    )
     df_per_subject.to_csv(os.path.join(reports_dir, "per_subject_metrics.csv"), index=False)
 
     df_predictions = pd.DataFrame({"True_Label": results['true_labels'], "Predicted_Label": results['predictions']})

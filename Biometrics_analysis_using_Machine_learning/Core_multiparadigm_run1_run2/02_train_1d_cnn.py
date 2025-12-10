@@ -17,6 +17,13 @@ from sklearn.metrics import (
 )
 import keras_tuner as kt
 
+# -------------------------------------------------------------------------
+# Global seeds for reproducibility
+# -------------------------------------------------------------------------
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+
 ###############################################################################
 # 1. Data Loading
 ###############################################################################
@@ -145,6 +152,46 @@ def compute_biometric_ci(y_test, scores_matrix, all_subjects, n_bootstraps=200):
         cis[m] = np.percentile(vals, [2.5, 97.5]) if vals else [0, 0]
     return cis, metrics
 
+# --- NEW: Function to save Per-Subject Metrics for Boxplots (Fig 4) ---
+def compute_and_save_per_subject_metrics(y_true, predictions, scores_matrix, subjects, save_path):
+    rows = []
+    subj_to_idx = {s: i for i, s in enumerate(sorted(subjects))}
+
+    for subj in subjects:
+        y_true_binary = (y_true == subj).astype(int)
+        y_pred_binary = (predictions == subj).astype(int)
+        
+        # Binary Scores for this subject (One-vs-Rest)
+        if subj in subj_to_idx:
+            y_scores_binary = scores_matrix[:, subj_to_idx[subj]]
+        else:
+            y_scores_binary = np.zeros(len(y_true))
+
+        acc = accuracy_score(y_true_binary, y_pred_binary)
+        prec = precision_score(y_true_binary, y_pred_binary, zero_division=0)
+        rec = recall_score(y_true_binary, y_pred_binary, zero_division=0)
+        f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+        
+        try:
+            fpr, tpr, _ = roc_curve(y_true_binary, y_scores_binary, pos_label=1)
+            fnr = 1 - tpr
+            eer_idx = np.nanargmin(np.abs(fpr - fnr))
+            eer = (fpr[eer_idx] + fnr[eer_idx]) / 2
+        except:
+            eer = np.nan
+
+        rows.append({
+            "Subject": subj,
+            "Accuracy": acc,
+            "Precision": prec,
+            "Recall": rec,
+            "F1_Score": f1,
+            "EER": eer
+        })
+        
+    pd.DataFrame(rows).to_csv(save_path, index=False)
+    print(f"[INFO] Saved per-subject metrics to {save_path}")
+
 ###############################################################################
 # 3. Hypermodel
 ###############################################################################
@@ -182,7 +229,6 @@ def main():
     X, y, runs, epoch_nums = load_features_from_hdf5(filename)
 
     # === FIX: DATA LEAKAGE PREVENTION ===
-    # 1. Identify indices
     train_idx = np.where(runs == "Run_1")[0]
     test_idx  = np.where(runs == "Run_2")[0]
     
@@ -201,11 +247,7 @@ def main():
     X_train_flat = transformer.transform(X_flat[train_idx])
     X_test_flat = transformer.transform(X_flat[test_idx])
     
-    # 5. Reshape back for CNN (assuming 32x28 structure after transform, check dimensions!)
-    # Note: PowerTransformer keeps dimensions. If input was (N, 1024), output is (N, 1024).
-    # We treat it as a 1D sequence of length 1024 for 1D CNN.
     flattened_length = X_train_flat.shape[1]
-    
     X_train_cnn = X_train_flat.reshape(X_train_flat.shape[0], flattened_length, 1)
     X_test_cnn = X_test_flat.reshape(X_test_flat.shape[0], flattened_length, 1)
 
@@ -275,11 +317,6 @@ def main():
     plt.savefig('det_curve_cnn.png')
     plt.close()
     
-    # 2. Accuracy/Loss Curves (Original)
-    plt.figure()
-    plt.plot(history.history['accuracy'], label='Train'); plt.plot(history.history['val_accuracy'], label='Val')
-    plt.title('Accuracy'); plt.legend(); plt.savefig('training_acc.png'); plt.close()
-    
     # === REPORTING ===
     results = {
         "Test Accuracy": f"{test_acc:.4f}",
@@ -294,6 +331,14 @@ def main():
         
     # Save Results
     pd.DataFrame([results]).to_csv("cnn_biometric_results.csv", index=False)
+    
+    # === NEW: Save Per-Subject Metrics for Figure 4 Boxplots ===
+    # Use the sorted classes from LabelEncoder to ensure column mapping is correct
+    compute_and_save_per_subject_metrics(
+        y_test, preds, preds_prob, le.classes_,
+        "per_subject_metrics_cnn.csv"
+    )
+    
     best_model.save("best_1d_cnn_model.h5")
 
 if __name__ == "__main__":
